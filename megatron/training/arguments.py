@@ -2013,6 +2013,8 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
+        # Added explicitly in _add_experimental_attention_variant_args.
+        "dsv4_moe_dispatcher",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3158,6 +3160,21 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
+    # DeepSeek V4
+    group.add_argument('--dsv4-moe-dispatcher', type=str, default='naive',
+                       choices=['naive', 'deepep'],
+                       help='Token dispatcher backend for the DeepSeek V4 MoE expert-parallel '
+                            'path. "naive" (default) uses all_gather + per-rank loop + all_reduce '
+                            'and is bit-exact with the single-rank reference. "deepep" uses '
+                            'DeepEP fused alltoall (--moe-permute-fusion required for '
+                            'determinism; expert_tensor_parallel_size==1 only).')
+    group.add_argument('--dsv4-slow-backward', action='store_true',
+                       default=False,
+                       help='Use the legacy dequantize-then-matmul backward for '
+                            'DeepSeek V4 grouped routed experts instead of the '
+                            'fused grouped FP4 grad-input kernel. Generic '
+                            'DSV4Linear FP8/FP4 backward always uses the exact '
+                            'dequantize-once cuBLAS path.')
     return parser
 
 def _add_heterogeneous_args(parser):

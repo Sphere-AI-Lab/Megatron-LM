@@ -1157,6 +1157,24 @@ class _DeepepManager(_DispatchManager):
             )
         set_deepep_num_sms(config.moe_deepep_num_sms)
 
+    def _expert_padding_alignment(self) -> int:
+        alignment = getattr(self.config, "dsv4_deepep_expert_alignment", None)
+        if alignment is not None:
+            alignment = int(alignment)
+            if alignment <= 0:
+                raise ValueError(
+                    "dsv4_deepep_expert_alignment must be a positive integer; "
+                    f"got {alignment}"
+                )
+            return alignment
+        return get_align_size_for_quantization(self.config)
+
+    def _should_pad_for_quantized_experts(self) -> bool:
+        return bool(
+            getattr(self.config, "moe_router_padding_for_quantization", False)
+            or getattr(self.config, "dsv4_deepep_expert_alignment", None) is not None
+        )
+
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
 
@@ -1259,7 +1277,7 @@ class _DeepepManager(_DispatchManager):
         """
         Pad the routing map to the nearest multiple of the pad_multiple.
         """
-        pad_multiple = get_align_size_for_quantization(self.config)
+        pad_multiple = self._expert_padding_alignment()
 
         num_input_tokens = routing_map.shape[0]
         target_tokens_per_expert = (
@@ -1293,7 +1311,7 @@ class _DeepepManager(_DispatchManager):
             self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs
             )
-        if self.config.moe_router_padding_for_quantization:
+        if self._should_pad_for_quantized_experts():
             self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
                 self.dispatched_routing_map, self.tokens_per_expert
             )
@@ -1313,7 +1331,7 @@ class _DeepepManager(_DispatchManager):
             num_out_tokens=self.tokens_per_expert.sum().item(),
             fused=self.permute_fusion,
             tokens_per_expert=self.tokens_per_expert,
-            align_size=get_align_size_for_quantization(self.config),
+            align_size=self._expert_padding_alignment(),
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)

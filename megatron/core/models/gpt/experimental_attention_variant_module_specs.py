@@ -6,6 +6,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4 import DeepSeekV4Attention
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -138,10 +139,33 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsv4":
+        return ModuleSpec(
+            module=DeepSeekV4Attention,
+            submodules=None,
+            metainfo={"fuse_input_layernorm": False},
+        )
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
         )
+
+
+def get_experimental_attention_variant_transformer_block_cls(config: TransformerConfig):
+    """Return a custom transformer block class for the experimental attention variant.
+
+    Some variants (notably DeepSeek V4) cannot be expressed as a sequence of standard
+    Megatron layers, so a model provider must instantiate a variant-specific block in
+    place of ``TransformerBlock``. Returns ``None`` for variants that work with the
+    standard block.
+    """
+    if config.experimental_attention_variant == "dsv4":
+        from megatron.core.transformer.experimental_attention_variant.deepseek_v4 import (
+            DeepSeekV4TransformerBlock,
+        )
+
+        return DeepSeekV4TransformerBlock
+    return None
 
 
 ##########

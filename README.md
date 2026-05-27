@@ -11,6 +11,14 @@ Megatron-LM and Megatron Core
 
 <div align="left">
 
+> **Fork notice -- Sphere AI Lab.** This repository is a fork of
+> [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM), maintained by
+> [Sphere AI Lab](https://github.com/Sphere-AI-Lab). All Sphere AI Lab changes are
+> contained in the single release commit on top of the upstream base `980211ae6`
+> (post `core_v0.15.0rc7`; see `git log` and [`NOTICE`](./NOTICE)). This fork is
+> pinned for use with [Orbit](https://github.com/Sphere-AI-Lab/orbit) and is not
+> an official NVIDIA release.
+
 ## About
 
 This repository contains two components: **Megatron-LM** and **Megatron Core**.

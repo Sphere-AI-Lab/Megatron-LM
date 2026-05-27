@@ -748,9 +748,9 @@ class InferenceTopKRouter(TopKRouter):
             f"InferenceTopKRouter requires moe_router_num_groups=None, "
             f"got {config.moe_router_num_groups}"
         )
-        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+        assert config.moe_router_score_function in ["sigmoid", "softmax", "sqrtsoftplus"], (
             f"InferenceTopKRouter requires moe_router_score_function in "
-            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+            f"['sigmoid', 'softmax', 'sqrtsoftplus'], got '{config.moe_router_score_function}'"
         )
 
         super().__init__(config=config, pg_collection=pg_collection)

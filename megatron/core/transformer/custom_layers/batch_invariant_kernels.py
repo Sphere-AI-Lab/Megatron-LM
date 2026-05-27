@@ -33,6 +33,8 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "matmul_fixed_order",
+    "LinearFixedOrderFn",
 ]
 
 
@@ -245,6 +247,392 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
         **configs[dtype],
     )
     return c
+
+
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def matmul_kernel_fixed_order(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Fixed-order fp32 matmul kernel for DSV4 batch-invariant projections."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k0 in range(0, K, BLOCK_SIZE_K):
+        k_idxs = k0 + offs_k
+        a = tl.load(
+            a_ptr + offs_m[:, None] * K + k_idxs[None, :],
+            mask=(offs_m[:, None] < M) & (k_idxs[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr + k_idxs[:, None] * N + offs_n[None, :],
+            mask=(k_idxs[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+        accumulator += tl.dot(a, b, input_precision="ieee")
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        accumulator += bias
+
+    tl.store(
+        c_ptr + offs_m[:, None] * N + offs_n[None, :],
+        accumulator,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def matmul_fixed_order(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    block_k: int = 64,
+) -> torch.Tensor:
+    """Batch-invariant fp32 matmul with a fixed K-reduction order."""
+    assert a.dim() == 2 and b.dim() == 2, "matmul_fixed_order expects 2D tensors"
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.dtype == torch.float32 and b.dtype == torch.float32, (
+        "matmul_fixed_order currently supports fp32 inputs only"
+    )
+    assert a.is_contiguous() and b.is_contiguous(), "inputs must be contiguous"
+    assert bias is None or (bias.dim() == 1 and bias.dtype == torch.float32)
+
+    M, K = a.shape
+    _, N = b.shape
+    if block_m is None and block_n is None:
+        # Keep the faster small-row tile for stateful decode, and use a wider
+        # N tile for prefill where compressor GEMMs dominate. The c4
+        # compressor has N=1024 and benefits earlier than the c128 N=512 path.
+        use_small_row_tile = M < 1280 if N <= 512 else M <= 512
+        block_m, block_n = (128, 32) if use_small_row_tile else (64, 128)
+    else:
+        block_m = 128 if block_m is None else block_m
+        block_n = 32 if block_n is None else block_n
+    c = torch.empty((M, N), device=a.device, dtype=torch.float32)
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    matmul_kernel_fixed_order[grid](
+        a,
+        b,
+        c,
+        bias,
+        M,
+        K,
+        N,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=block_k,
+        HAS_BIAS=bias is not None,
+        num_stages=3,
+        num_warps=8,
+    )
+    return c
+
+
+class LinearFixedOrderFn(torch.autograd.Function):
+    """Fixed-order fp32 linear forward with torch-equivalent GEMM backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if x.dtype != torch.float32 or weight.dtype != torch.float32:
+            raise RuntimeError("LinearFixedOrderFn requires fp32 input and weight.")
+        if weight.dim() != 2:
+            raise RuntimeError("LinearFixedOrderFn requires a 2D weight.")
+
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        weight_2d = weight.contiguous()
+        out_2d = matmul_fixed_order(x_2d, weight_2d.t().contiguous(), bias=bias)
+
+        ctx.input_shape = x.shape
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(x_2d, weight_2d)
+        return out_2d.reshape(*x.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_2d, weight = ctx.saved_tensors
+        grad_2d = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+
+        grad_x = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_2d.matmul(weight).reshape(ctx.input_shape)
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_2d.transpose(0, 1).matmul(x_2d)
+        if ctx.has_bias and ctx.needs_input_grad[2]:
+            grad_bias = grad_2d.sum(dim=0)
+
+        return grad_x, grad_weight, grad_bias
+
+
+@triton.jit
+def _rms_norm_forward_rsigma_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    rsigma_ptr,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_start_ptr = input_ptr + row_idx * input_row_stride
+    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+
+    sum_sq = tl.full((), 0.0, dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0).to(tl.float32)
+        sum_sq += tl.sum(tl.where(mask, vals * vals, 0.0))
+
+    inv_rms = 1.0 / tl.sqrt(sum_sq / n_cols + eps)
+    tl.store(rsigma_ptr + row_idx, inv_rms)
+
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        weight_vals = tl.load(weight_ptr + col_idx, mask=mask, other=1.0)
+        out = vals.to(tl.float32) * inv_rms * weight_vals.to(tl.float32)
+        tl.store(output_row_start_ptr + col_idx, out.to(vals.dtype), mask=mask)
+
+
+def _rms_norm_with_rsigma(
+    input_: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm forward that also returns per-row inverse RMS for backward."""
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input_.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input_.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+    original_shape = input_.shape
+    input_2d = input_.reshape(-1, input_.shape[-1]).contiguous()
+    weight = weight.contiguous()
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d)
+    rsigma = torch.empty((n_rows,), device=input_.device, dtype=torch.float32)
+    _rms_norm_forward_rsigma_kernel[(n_rows,)](
+        input_2d,
+        weight,
+        output,
+        rsigma,
+        input_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        eps,
+        BLOCK_SIZE=1024,
+    )
+    return output.reshape(original_shape), rsigma.reshape(*original_shape[:-1], 1)
+
+
+@triton.jit
+def _rms_norm_backward_row_dot_kernel(
+    x_ptr,
+    grad_out_ptr,
+    weight_ptr,
+    row_dot_ptr,
+    x_row_stride: tl.constexpr,
+    grad_out_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    x_row_start_ptr = x_ptr + row_idx * x_row_stride
+    grad_out_row_start_ptr = grad_out_ptr + row_idx * grad_out_row_stride
+
+    acc = tl.full((), 0.0, dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        x_vals = tl.load(x_row_start_ptr + col_idx, mask=mask, other=0.0).to(tl.float32)
+        grad_vals = tl.load(grad_out_row_start_ptr + col_idx, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        weight_vals = tl.load(weight_ptr + col_idx, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.sum(tl.where(mask, x_vals * grad_vals * weight_vals, 0.0))
+
+    tl.store(row_dot_ptr + row_idx, acc)
+
+
+@triton.jit
+def _rms_norm_backward_dx_dw_partial_kernel(
+    x_ptr,
+    grad_out_ptr,
+    weight_ptr,
+    rsigma_ptr,
+    row_dot_ptr,
+    dx_ptr,
+    partial_dw_ptr,
+    x_row_stride: tl.constexpr,
+    grad_out_row_stride: tl.constexpr,
+    dx_row_stride: tl.constexpr,
+    partial_dw_row_stride: tl.constexpr,
+    n_rows: tl.constexpr,
+    n_cols: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row_block = tl.program_id(0).to(tl.int64)
+    col_block = tl.program_id(1)
+    rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (rows[:, None] < n_rows) & (cols[None, :] < n_cols)
+
+    x_vals = tl.load(
+        x_ptr + rows[:, None] * x_row_stride + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    grad_vals = tl.load(
+        grad_out_ptr + rows[:, None] * grad_out_row_stride + cols[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    weight_vals = tl.load(weight_ptr + cols, mask=cols < n_cols, other=0.0).to(tl.float32)
+    rsigma_vals = tl.load(rsigma_ptr + rows, mask=rows < n_rows, other=0.0).to(tl.float32)
+    row_dot_vals = tl.load(row_dot_ptr + rows, mask=rows < n_rows, other=0.0).to(tl.float32)
+
+    rsigma_2d = rsigma_vals[:, None]
+    dx_vals = (
+        grad_vals * weight_vals[None, :] * rsigma_2d
+        - x_vals * (rsigma_2d * rsigma_2d * rsigma_2d) * row_dot_vals[:, None] / n_cols
+    )
+    tl.store(
+        dx_ptr + rows[:, None] * dx_row_stride + cols[None, :],
+        dx_vals,
+        mask=mask,
+    )
+
+    partial_dw = tl.sum(tl.where(mask, grad_vals * x_vals * rsigma_2d, 0.0), axis=0)
+    tl.store(
+        partial_dw_ptr + row_block * partial_dw_row_stride + cols,
+        partial_dw,
+        mask=cols < n_cols,
+    )
+
+
+@triton.jit
+def _rms_norm_backward_dw_reduce_kernel(
+    partial_dw_ptr,
+    grad_weight_ptr,
+    partial_dw_row_stride: tl.constexpr,
+    n_row_blocks: tl.constexpr,
+    n_cols: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    col_block = tl.program_id(0)
+    cols = col_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    row_offsets = tl.arange(0, BLOCK_R)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for row_start in range(0, n_row_blocks, BLOCK_R):
+        rows = row_start + row_offsets
+        vals = tl.load(
+            partial_dw_ptr + rows[:, None] * partial_dw_row_stride + cols[None, :],
+            mask=(rows[:, None] < n_row_blocks) & (cols[None, :] < n_cols),
+            other=0.0,
+        )
+        acc += tl.sum(vals, axis=0)
+
+    tl.store(grad_weight_ptr + cols, acc, mask=cols < n_cols)
+
+
+def _rms_norm_backward_fused(
+    grad_output: torch.Tensor,
+    x: torch.Tensor,
+    weight_eff: torch.Tensor,
+    rsigma: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    original_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    grad_2d = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+    weight_eff = weight_eff.contiguous()
+    rsigma_1d = rsigma.reshape(-1).contiguous()
+    n_rows, n_cols = x_2d.shape
+
+    if n_rows == 0:
+        return torch.empty_like(x), torch.zeros_like(weight_eff)
+
+    row_dot = torch.empty((n_rows,), device=x.device, dtype=torch.float32)
+    dx_2d = torch.empty_like(x_2d)
+
+    _rms_norm_backward_row_dot_kernel[(n_rows,)](
+        x_2d,
+        grad_2d,
+        weight_eff,
+        row_dot,
+        x_2d.stride(0),
+        grad_2d.stride(0),
+        n_cols,
+        BLOCK_SIZE=1024,
+    )
+
+    block_m = 16
+    block_n = 256
+    block_r = 64
+    n_row_blocks = triton.cdiv(n_rows, block_m)
+    partial_dw = torch.empty((n_row_blocks, n_cols), device=x.device, dtype=torch.float32)
+
+    _rms_norm_backward_dx_dw_partial_kernel[
+        (n_row_blocks, triton.cdiv(n_cols, block_n))
+    ](
+        x_2d,
+        grad_2d,
+        weight_eff,
+        rsigma_1d,
+        row_dot,
+        dx_2d,
+        partial_dw,
+        x_2d.stride(0),
+        grad_2d.stride(0),
+        dx_2d.stride(0),
+        partial_dw.stride(0),
+        n_rows,
+        n_cols,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        num_warps=8,
+    )
+
+    grad_weight = torch.empty_like(weight_eff)
+    _rms_norm_backward_dw_reduce_kernel[(triton.cdiv(n_cols, block_n),)](
+        partial_dw,
+        grad_weight,
+        partial_dw.stride(0),
+        n_row_blocks,
+        n_cols,
+        BLOCK_N=block_n,
+        BLOCK_R=block_r,
+        num_warps=8,
+    )
+
+    return dx_2d.reshape(original_shape), grad_weight
 
 
 @triton.jit
@@ -796,6 +1184,30 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         else:
             grad_out_2d = grad_output
 
+        if transa and not transb and A.dim() == 2 and opB.dim() >= 2:
+            # Common DSV4 path: forward computes B_flat @ A.T where A is the
+            # [out, in] weight and B is the token matrix. Avoid materializing
+            # B.T.contiguous(), which is very expensive at long sequence.
+            opB_2d = opB.reshape(-1, opB.shape[-1])
+            if grad_output.dim() >= 2:
+                grad_out_2d = grad_output.reshape(
+                    opB_2d.shape[0], grad_output.shape[-1]
+                ).contiguous()
+
+            dA = None
+            dB = None
+            if ctx.needs_input_grad[0]:
+                dA = grad_out_2d.transpose(0, 1).matmul(opB_2d)
+            if ctx.needs_input_grad[1]:
+                dB_2d = grad_out_2d.matmul(A)
+                dB = dB_2d.reshape_as(B)
+
+            if ctx.bias_present:
+                dbias = grad_out_2d.sum(dim=0)
+            else:
+                dbias = None
+            return dA, dB, dbias, None, None
+
         # Y = B_flat @ A -> dB_flat = dY @ A^T ; dA = B_flat^T @ dY
         d_opB_2d = grad_out_2d.matmul(opA.transpose(0, 1).contiguous())
         d_opA = opB.reshape(-1, opB.shape[-1]).transpose(0, 1).contiguous().matmul(grad_out_2d)
@@ -890,15 +1302,9 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
             raise RuntimeError(f"Unsupported dtype for batch-invariant RMSNorm: {x.dtype}")
         weight_eff = weight + 1.0 if zero_centered_gamma else weight
 
-        # We do everything in rmsnorm_batch_invariant manually here so that we can
-        # save rsigma in full precision for backward to match the TE behavior.
-        x_dtype = x.dtype
-        x_fp32 = x.float()
-        w_fp32 = weight.to(device=x.device, dtype=torch.float32)
-        ms = mean_dim(x_fp32 * x_fp32, dim=-1, keepdim=True)
-        rsigma = torch.rsqrt(ms + eps)
-        out_fp32 = (x_fp32 * rsigma) * w_fp32
-        out = out_fp32.to(x_dtype)
+        # Forward follows the raw persistent kernel and saves the exact per-row
+        # inverse RMS used by that kernel for the fused backward.
+        out, rsigma = _rms_norm_with_rsigma(x, weight_eff, eps)
 
         # Save for backward
         ctx.eps = eps
@@ -918,19 +1324,8 @@ class BatchInvariantRMSNormFn(torch.autograd.Function):
         x, weight, rsigma = ctx.saved_tensors
         w_eff = (weight + 1.0) if ctx.zero_centered_gamma else weight
 
-        go_fp32 = grad_output.float()
-        x_fp32 = x.float()
-        w_fp32 = w_eff.to(device=x.device, dtype=torch.float32)
-        r = rsigma
-        r3 = r * r * r
-        D = x.shape[-1]
-
-        red_dims = tuple(range(0, go_fp32.ndim - 1))
-        g_w = (go_fp32 * x_fp32 * r).sum(dim=red_dims).to(weight.dtype)
-
-        s = (go_fp32 * x_fp32 * w_fp32).sum(dim=-1, keepdim=True)
-        dx = go_fp32 * (w_fp32 * r) - (w_fp32 * r3) * (s * x_fp32) / D
-        dx = dx.to(x.dtype)
+        dx, g_w = _rms_norm_backward_fused(grad_output, x, w_eff, rsigma)
+        g_w = g_w.to(weight.dtype)
 
         return dx, g_w, None, None
 

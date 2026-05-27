@@ -262,8 +262,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4']] = None
+    """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4."""
 
     ####################
     # DSA
@@ -283,6 +283,51 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    ####################
+    # DeepSeek V4
+    ####################
+    dsv4_o_groups: Optional[int] = None
+    """Number of DeepSeek V4 output low-rank projection groups."""
+
+    dsv4_o_lora_rank: Optional[int] = None
+    """DeepSeek V4 output low-rank projection rank."""
+
+    dsv4_window_size: Optional[int] = None
+    """DeepSeek V4 sliding-window attention size."""
+
+    dsv4_compress_ratios: Optional[List[int]] = None
+    """Per-layer DeepSeek V4 compressed-KV ratios. A value of 0 disables compression."""
+
+    dsv4_compress_rope_theta: Optional[int] = None
+    """RoPE theta used by DeepSeek V4 compressed-KV paths."""
+
+    dsv4_hc_mult: Optional[int] = None
+    """DeepSeek V4 manifold HyperConnection multiplier."""
+
+    dsv4_hc_sinkhorn_iters: Optional[int] = None
+    """Number of DeepSeek V4 mHC Sinkhorn iterations."""
+
+    dsv4_hc_eps: Optional[float] = None
+    """DeepSeek V4 mHC Sinkhorn epsilon."""
+
+    dsv4_swiglu_limit: Optional[float] = None
+    """DeepSeek V4 SwiGLU clamp limit."""
+
+    dsv4_n_hash_layers: Optional[int] = None
+    """Number of DeepSeek V4 hash-routed layers."""
+
+    dsv4_moe_dispatcher: str = "naive"
+    """Token dispatcher for the DeepSeek V4 MoE expert-parallel path. One of:
+    - ``"naive"``: all_gather + per-rank loop + all_reduce. Bit-exact with the
+      single-rank reference; no extra dependencies. Default.
+    - ``"deepep"``: fused all-to-all dispatch / combine via the DeepEP kernels
+      (``megatron.core.transformer.moe.token_dispatcher._DeepepManager``).
+      Faster EP communication path than ``"naive"``, but not a bit-parity
+      backend: DeepEP combine is BF16-only while the naive reference
+      accumulates routed contributions in FP32. Requires the ``deep_ep``
+      package to be importable, ``--expert-model-parallel-size > 1``,
+      ``--moe-permute-fusion``, and ``expert_tensor_parallel_size == 1``."""
 
     ####################
     # linear attention
@@ -695,8 +740,8 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
-    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+    moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
+    """Score function for MoE routing. Can be "softmax", "sigmoid", or "sqrtsoftplus"."""
 
     moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
@@ -2231,6 +2276,23 @@ class TransformerConfig(ModelParallelConfig):
                 self.context_parallel_size == 1
             ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+
+        if self.experimental_attention_variant == "dsv4":
+            assert self.multi_latent_attention, "DeepSeek V4 attention requires MLA config."
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DeepSeek V4."
+            assert self.dsv4_o_groups is not None, "dsv4_o_groups must be set."
+            assert self.dsv4_o_lora_rank is not None, "dsv4_o_lora_rank must be set."
+            assert self.dsv4_window_size is not None, "dsv4_window_size must be set."
+            assert self.dsv4_compress_rope_theta is not None, (
+                "dsv4_compress_rope_theta must be set."
+            )
+            assert self.dsv4_o_groups % self.tensor_model_parallel_size == 0, (
+                "dsv4_o_groups must be divisible by tensor_model_parallel_size."
+            )
+            if self.dsv4_compress_ratios is not None:
+                assert len(self.dsv4_compress_ratios) == self.num_layers, (
+                    "Length of dsv4_compress_ratios must match num_layers."
+                )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

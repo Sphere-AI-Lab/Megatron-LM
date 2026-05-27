@@ -263,6 +263,13 @@ class GPTModel(LanguageModule):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
+        if self.post_process and self.config.experimental_attention_variant == "dsv4":
+            from megatron.core.transformer.experimental_attention_variant.deepseek_v4 import (
+                maybe_wrap_dsv4_lm_head_batch_invariant,
+            )
+
+            maybe_wrap_dsv4_lm_head_batch_invariant(self)
+
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'

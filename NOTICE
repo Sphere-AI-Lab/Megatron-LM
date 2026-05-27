@@ -1,0 +1,14 @@
+Megatron-LM / Megatron-Core -- Sphere AI Lab fork
+Copyright 2026 Sphere AI Lab
+
+This product is a fork of NVIDIA Megatron-LM
+(https://github.com/NVIDIA/Megatron-LM),
+Copyright (c) 2019-2025, NVIDIA CORPORATION. All rights reserved.
+
+The upstream project is distributed under the Apache License, Version 2.0, with
+portions under the 3-Clause BSD License (see LICENSE). Those terms and copyright
+notices are retained unchanged.
+
+Sphere AI Lab modifications relative to the upstream base
+(NVIDIA/Megatron-LM main @ 980211ae6, post core_v0.15.0rc7) are contained in the
+single release commit on top of that base and are licensed under the same terms.
